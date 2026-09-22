@@ -23,6 +23,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from .config import Settings, load_settings
 from .db import Database
 from .schemas import (
+    DelegatedTokenResponse,
+    DelegateTokenRequest,
     IssuedTokenResponse,
     IssueTokenRequest,
     RevocationEntry,
@@ -36,6 +38,7 @@ from .tokens import (
     TokenError,
     canonical_method,
     canonical_path,
+    delegate_token,
     issue_token,
     verify_token,
 )
@@ -53,6 +56,8 @@ _ERROR_STATUS = {
     "subject_revoked": status.HTTP_401_UNAUTHORIZED,
     "method_mismatch": status.HTTP_403_FORBIDDEN,
     "path_mismatch": status.HTTP_403_FORBIDDEN,
+    "delegation_exceeds_parent": status.HTTP_403_FORBIDDEN,
+    "delegation_depth_exceeded": status.HTTP_403_FORBIDDEN,
 }
 
 #: Delete expired consumed nonces and stale revocations periodically.
@@ -144,11 +149,14 @@ async def lifespan(app: FastAPI) -> None:
 
 app = FastAPI(
     title="Capability Token API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "Issue short-lived HMAC-signed capability tokens for HTTP operations "
         "(e.g. file downloads) and verify method/path binding, expiry, "
-        "signature, one-time nonces and subject-level revocation."
+        "signature, one-time nonces and subject-level revocation. Holders of "
+        "a valid token may delegate strictly attenuated child tokens; "
+        "delegation chains (max 4 layers) are carried in the signed payload "
+        "and verified recursively."
     ),
     lifespan=lifespan,
 )
@@ -263,6 +271,67 @@ def issue(body: IssueTokenRequest, settings: SettingsDep) -> IssuedTokenResponse
     )
 
 
+@app.post(
+    "/tokens/delegate",
+    response_model=DelegatedTokenResponse,
+    tags=["tokens"],
+)
+def delegate(
+    body: DelegateTokenRequest, settings: SettingsDep, db: DbDep
+) -> DelegatedTokenResponse:
+    """Attenuate a parent capability into a narrower child token.
+
+    The parent token itself is the credential, so any holder of a valid
+    token may delegate without an X-Issuer-Key. The child can never exceed
+    the parent's method, path subtree, remaining lifetime or subject, and
+    the delegation chain is capped at 4 layers.
+    """
+    ttl = body.ttl_seconds or settings.default_ttl
+    ttl = min(ttl, settings.max_ttl)
+
+    try:
+        delegated = delegate_token(
+            settings.keyring,
+            parent_token=body.parent_token,
+            method=body.method,
+            path=body.path,
+            ttl_seconds=ttl,
+            subject=body.subject,
+            one_time=body.one_time,
+            extra=body.extra,
+            db=db,
+        )
+    except TokenError as exc:
+        raise _http_error(exc) from exc
+
+    issued = delegated.issued
+    logger.info(
+        "Delegated token jti=%s kid=%s %s %s exp=%s depth=%s parent_jti=%s sub=%s",
+        issued.nonce,
+        issued.kid,
+        issued.method,
+        issued.path,
+        issued.expires_at,
+        delegated.chain_depth,
+        delegated.parent_token_id,
+        issued.payload.get("sub"),
+    )
+    return DelegatedTokenResponse(
+        token=issued.token,
+        token_id=issued.nonce,
+        kid=issued.kid,
+        method=issued.method,
+        path=issued.path,
+        issued_at=issued.payload["iat"],
+        expires_at=issued.expires_at,
+        expires_in=issued.expires_in,
+        one_time=issued.one_time,
+        subject=issued.payload.get("sub"),
+        parent_token_id=delegated.parent_token_id,
+        chain_depth=delegated.chain_depth,
+    )
+
+
 @app.post("/tokens/verify", response_model=VerifyTokenResponse, tags=["tokens"])
 def verify(body: VerifyTokenRequest, settings: SettingsDep, db: DbDep) -> VerifyTokenResponse:
     try:
@@ -290,6 +359,7 @@ def verify(body: VerifyTokenRequest, settings: SettingsDep, db: DbDep) -> Verify
         token_id=verified.nonce,
         subject=verified.subject,
         extra=verified.extra,
+        chain_depth=verified.chain_depth,
     )
 
 
@@ -406,7 +476,10 @@ def download_file(
     return FileResponse(
         target,
         filename=target.name,
-        headers={"X-Capability-Id": verified.nonce},
+        headers={
+            "X-Capability-Id": verified.nonce,
+            "X-Capability-Chain-Depth": str(verified.chain_depth),
+        },
     )
 
 

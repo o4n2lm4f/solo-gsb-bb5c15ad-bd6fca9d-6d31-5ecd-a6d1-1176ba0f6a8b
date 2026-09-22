@@ -2,7 +2,11 @@ services:
   capability-api:
     build: .
     image: capability-token-api:latest
-    container_name: capability-token-api
+    container_name: capability-api
+    # Endpoints (curl examples in README, incl. POST /tokens/delegate for
+    # attenuated delegation chains capped at 4 layers):
+    #   POST /tokens/issue | POST /tokens/delegate | POST /tokens/verify
+    #   GET  /files/{path} | POST /tokens/revoke-subject | GET /tokens/revocations
     ports:
       - "8000:8000"
     environment:

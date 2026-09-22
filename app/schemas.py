@@ -7,7 +7,9 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 
-class IssueTokenRequest(BaseModel):
+class CapabilityBinding(BaseModel):
+    """Shared method/path binding fields for token-issuing requests."""
+
     method: str = Field(
         ..., min_length=1, max_length=16, description="HTTP method the token is bound to, e.g. GET"
     )
@@ -17,12 +19,6 @@ class IssueTokenRequest(BaseModel):
         max_length=2048,
         description="Path the token is bound to, e.g. /files/report.pdf",
     )
-    ttl_seconds: int | None = Field(
-        default=None, ge=1, le=24 * 3600, description="Lifetime in seconds (server may cap it)"
-    )
-    one_time: bool = Field(default=False, description="If true the token can be consumed once only")
-    subject: str | None = Field(default=None, max_length=256)
-    extra: dict[str, Any] | None = Field(default=None, description="Arbitrary extra claims")
 
     @field_validator("path")
     @classmethod
@@ -40,6 +36,46 @@ class IssueTokenRequest(BaseModel):
         return cleaned
 
 
+class IssueTokenRequest(CapabilityBinding):
+    ttl_seconds: int | None = Field(
+        default=None, ge=1, le=24 * 3600, description="Lifetime in seconds (server may cap it)"
+    )
+    one_time: bool = Field(default=False, description="If true the token can be consumed once only")
+    subject: str | None = Field(default=None, max_length=256)
+    extra: dict[str, Any] | None = Field(default=None, description="Arbitrary extra claims")
+
+
+class DelegateTokenRequest(CapabilityBinding):
+    parent_token: str = Field(
+        ...,
+        min_length=1,
+        max_length=65536,
+        description="Valid parent capability token; the child is attenuated from it",
+    )
+    ttl_seconds: int | None = Field(
+        default=None,
+        ge=1,
+        le=24 * 3600,
+        description=(
+            "Lifetime in seconds. Clamped to CAPABILITY_MAX_TTL and to the parent's "
+            "remaining lifetime"
+        ),
+    )
+    subject: str | None = Field(
+        default=None,
+        max_length=256,
+        description="Must equal the parent token's subject; omit to inherit it",
+    )
+    one_time: bool | None = Field(
+        default=None,
+        description=(
+            "If true the child is single-use. Omit to inherit the parent's "
+            "constraint; a one-time parent cannot delegate a reusable child"
+        ),
+    )
+    extra: dict[str, Any] | None = Field(default=None, description="Arbitrary extra claims")
+
+
 class IssuedTokenResponse(BaseModel):
     token: str
     token_id: str
@@ -53,6 +89,25 @@ class IssuedTokenResponse(BaseModel):
     expires_in: int
     one_time: bool
     subject: str | None = None
+
+
+class DelegatedTokenResponse(BaseModel):
+    token: str
+    token_id: str
+    kid: str | None = Field(
+        default=None, description="Id of the ring key that signed this token"
+    )
+    method: str
+    path: str
+    issued_at: int
+    expires_at: int
+    expires_in: int
+    one_time: bool
+    subject: str | None = None
+    parent_token_id: str = Field(description="jti of the immediate parent token")
+    chain_depth: int = Field(
+        description="Layers in the delegation chain including this token (root is 1)"
+    )
 
 
 class VerifyTokenRequest(BaseModel):
@@ -91,6 +146,10 @@ class VerifyTokenResponse(BaseModel):
     token_id: str
     subject: str | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
+    chain_depth: int = Field(
+        default=1,
+        description="Number of layers in the delegation chain (1 = not delegated)",
+    )
 
 
 class RevokeSubjectRequest(BaseModel):
