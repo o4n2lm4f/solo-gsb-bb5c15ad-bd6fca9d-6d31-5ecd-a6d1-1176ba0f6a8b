@@ -61,6 +61,71 @@ class Database:
 
     # -- verification ------------------------------------------------------
 
+    def check_chain_revocation_and_consume_nonces(
+        self,
+        entries: list[dict[str, Any]],
+        *,
+        consume: bool,
+    ) -> VerifyOutcome:
+        """Check revocation and consume nonces for a delegation chain atomically.
+
+        *entries* are the layers of the chain (leaf first), each with
+        ``subject`` / ``issued_at`` / ``nonce`` / ``expires_at`` /
+        ``one_time``. Every layer is checked for subject revocation and, when
+        it is a one-time token and *consume* is true, its nonce is inserted —
+        all inside ONE ``BEGIN IMMEDIATE`` transaction:
+
+        * any layer whose subject was revoked at or before its ``iat`` makes
+          the whole chain fail with ``"subject_revoked"`` and no nonce is
+          burned;
+        * any layer whose nonce was already consumed makes the whole chain
+          fail with ``"nonce_replayed"`` (a one-time token therefore cannot
+          be widened into reusable delegated children).
+
+        ``consume=False`` checks revocation and replay state but inserts
+        nothing (dry runs and delegation issuance). A chain without subjects
+        that needs no nonce work stays fully stateless.
+        """
+        nonce_entries = [
+            entry
+            for entry in entries
+            if entry["subject"] is not None or (consume and entry["one_time"])
+        ]
+        if not nonce_entries:
+            return "ok"
+        with self.connect() as conn:
+            try:
+                # IMMEDIATE acquires a RESERVED lock immediately, turning
+                # racing writers into a clean serialisation instead of a
+                # mid-transaction SQLITE_BUSY upgrade failure.
+                conn.execute("BEGIN IMMEDIATE")
+                for entry in nonce_entries:
+                    if entry["subject"] is not None:
+                        row = conn.execute(
+                            "SELECT cutoff FROM subject_revocations WHERE subject = ?",
+                            (entry["subject"],),
+                        ).fetchone()
+                        if row is not None and entry["issued_at"] <= row["cutoff"]:
+                            conn.rollback()
+                            return "subject_revoked"
+                if consume:
+                    for entry in nonce_entries:
+                        if not entry["one_time"]:
+                            continue
+                        cursor = conn.execute(
+                            "INSERT OR IGNORE INTO consumed_nonces (nonce, expires_at) "
+                            "VALUES (?, ?)",
+                            (entry["nonce"], entry["expires_at"]),
+                        )
+                        if cursor.rowcount != 1:
+                            conn.rollback()
+                            return "nonce_replayed"
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return "ok"
+
     def check_revocation_and_consume_nonce(
         self,
         *,
@@ -70,47 +135,24 @@ class Database:
         expires_at: int,
         consume: bool,
     ) -> VerifyOutcome:
-        """Check subject revocation and consume a nonce in ONE transaction.
-
-        The revocation lookup and the nonce insert share a single
-        ``BEGIN IMMEDIATE`` transaction, so a revocation committed
-        concurrently either blocks the nonce burn or is itself blocked by
-        the committed burn — the two can never half-apply. A revoked token
-        returns ``"subject_revoked"`` and its nonce is *not* consumed.
-
-        ``consume=False`` performs the revocation check only (dry run);
-        subject-less tokens that do not need consumption stay fully
-        stateless and never touch the database.
+        """Single-token wrapper around
+        :meth:`check_chain_revocation_and_consume_nonces` (kept for callers
+        that verify one unchained token directly). A nonce only exists for a
+        one-time token; the single-token API conflates that with *consume*
+        historically, which is equivalent: non-consume never checks replays.
         """
-        if subject is None and not consume:
-            return "ok"
-        with self.connect() as conn:
-            try:
-                # IMMEDIATE acquires a RESERVED lock immediately, turning
-                # racing writers into a clean serialisation instead of a
-                # mid-transaction SQLITE_BUSY upgrade failure.
-                conn.execute("BEGIN IMMEDIATE")
-                if subject is not None:
-                    row = conn.execute(
-                        "SELECT cutoff FROM subject_revocations WHERE subject = ?",
-                        (subject,),
-                    ).fetchone()
-                    if row is not None and issued_at <= row["cutoff"]:
-                        conn.rollback()
-                        return "subject_revoked"
-                if consume:
-                    cursor = conn.execute(
-                        "INSERT OR IGNORE INTO consumed_nonces (nonce, expires_at) VALUES (?, ?)",
-                        (nonce, expires_at),
-                    )
-                    if cursor.rowcount != 1:
-                        conn.rollback()
-                        return "nonce_replayed"
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-        return "ok"
+        return self.check_chain_revocation_and_consume_nonces(
+            [
+                {
+                    "subject": subject,
+                    "issued_at": issued_at,
+                    "nonce": nonce,
+                    "expires_at": expires_at,
+                    "one_time": True,
+                }
+            ],
+            consume=consume,
+        )
 
     # -- subject revocations ------------------------------------------------
 

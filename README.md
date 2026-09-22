@@ -16,6 +16,10 @@ HTTP 操作签发**短期 HMAC 签名令牌**，并在使用时进行严格验�
 - 🚫 **主体级撤销**：管理员可按 `subject` 设置撤销截止时间，`iat` 不晚于截止时间的
   令牌一律 401；撤销判断与 nonce 消费在**同一个 SQLite 事务**中完成，被撤销的令牌
   不会消耗 nonce，且支持一键恢复
+- 🪪 **令牌委托（`POST /tokens/delegate`）**：持父令牌可签发**只收窄、不放大**的子令牌
+  （方法相同、路径必须是父路径的子段、有效期不超过父令牌、主体相同）；父令牌完整嵌入
+  子令牌签名负载的 `del` 声明形成**委托链**，验证/下载时**递归校验每一跳**的签名、过期、
+  撤销与一次性 nonce，链深超过 **4 层**或任一祖先失效即拒绝，响应回传链深与最终约束
 - 🚀 启动时自动初始化数据库，监听 **8000** 端口
 - 🐳 提供 `Dockerfile` 与 `docker-compose.yml`，开箱即用
 
@@ -35,7 +39,7 @@ HTTP 操作签发**短期 HMAC 签名令牌**，并在使用时进行严格验�
 ├── files/               # 受保护的示例下载目录（compose 只读挂载）
 │   └── hello.txt
 ├── tests/
-│   └── test_api.py      # 48 个端到端测试（无需网络/容器）
+│   └── test_api.py      # 62 个端到端测试（无需网络/容器）
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
@@ -227,6 +231,145 @@ curl -X POST http://localhost:8000/tokens/revoke-subject \
 Docker Compose 场景下把 `CAPABILITY_ADMIN_KEY` 写进 `.env`（见 `.env.example`），
 然后在宿主机直接执行上面的 curl 即可（compose 默认映射 `8000:8000`）。
 
+### 5. 令牌委托（收窄再签发）
+
+持有父令牌的一方无需知道签名密钥，即可调用 `POST /tokens/delegate` 签发子令牌。
+服务端会先完整验证父令牌（含其整条委托链），然后**只允许收窄**权限：
+
+| 维度 | 规则 |
+| --- | --- |
+| `method` | 子令牌方法必须与父令牌**完全相同**，不能把 `GET` 委托成 `DELETE` |
+| `path` | 子路径必须等于父路径，或是其**按路径段**的下级（`/files` 覆盖 `/files/a/b`，但**不**覆盖 `/files-evil`） |
+| 有效期 | 子令牌 `exp` 绝不晚于父令牌 `exp`；请求的 `ttl_seconds` 会被自动截断到父令牌剩余寿命 |
+| `subject` | 必须与父令牌主体相同；省略 `subject` 则自动继承，换主体一律拒绝 |
+| 一次性 | 子令牌继承父令牌的 `one_time`，一次性令牌不可能被委托放大成可重复使用 |
+
+父令牌的**完整字符串**被写入子令牌签名负载的 `del` 声明，于是整条链是自包含的：
+验证子令牌时沿 `del` 逐跳回溯，每一跳都独立验签、查过期、查撤销、查一次性 nonce，
+并从两层签名负载重新推导上面的包含关系（不信任签发时的检查）。链中令牌总数最多
+**4 个**（根令牌深度 1）；超过 4 层返回 `403 chain_too_deep`。任一祖先过期、被撤销、
+nonce 已消费或签名无效，子令牌立即失效。
+
+```bash
+# 1) 服务端先签发一个较宽的父令牌（覆盖整个 /files，10 分钟，主体 alice）
+PARENT=$(curl -s -X POST http://localhost:8000/tokens/issue \
+  -H 'Content-Type: application/json' \
+  -d '{"method":"GET","path":"/files","ttl_seconds":600,"subject":"alice"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+# 2) 持有父令牌的一方把它收窄为：只能下载单个文件、最多 120 秒
+curl -s -X POST http://localhost:8000/tokens/delegate \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"parent_token\": \"${PARENT}\",
+    \"method\": \"GET\",
+    \"path\": \"/files/hello.txt\",
+    \"ttl_seconds\": 120
+  }"
+```
+
+委托响应（注意 `chain_depth`、`constraints` 与 TTL 截断标志）：
+
+```json
+{
+  "token": "eyJ...（子令牌，其签名负载的 del 字段内嵌完整父令牌）",
+  "token_id": "child-jti",
+  "kid": "dev",
+  "method": "GET",
+  "path": "/files/hello.txt",
+  "issued_at": 1727000000,
+  "expires_at": 1727000120,
+  "expires_in": 120,
+  "one_time": false,
+  "subject": "alice",
+  "chain_depth": 2,
+  "constraints": {
+    "method": "GET",
+    "path": "/files/hello.txt",
+    "expires_at": 1727000120,
+    "subject": "alice",
+    "one_time": false
+  },
+  "parent_token_id": "parent-jti",
+  "parent_expires_at": 1727000600,
+  "ttl_capped_to_parent": false
+}
+```
+
+> 若申请的寿命超过父令牌剩余时间，响应里的 `expires_in`/`expires_at` 会被截断，
+> 且 `ttl_capped_to_parent` 为 `true`。
+
+子令牌的使用方式与普通令牌完全一致——验证接口会回传链深与最终约束：
+
+```bash
+# 3) 递归验证（每一跳的签名/过期/撤销/nonce/约束都被检查）
+curl -s -X POST http://localhost:8000/tokens/verify \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"<CHILD_TOKEN>","method":"GET","path":"/files/hello.txt"}'
+# { "valid": true, ..., "chain_depth": 2,
+#   "constraints": {"method":"GET","path":"/files/hello.txt",
+#                   "expires_at":1727000120,"subject":"alice","one_time":false} }
+
+# 4) 也可以直接用于下载；响应头 X-Capability-Chain-Depth 回显链深
+curl -i "http://localhost:8000/files/hello.txt?token=<CHILD_TOKEN>"
+# HTTP/1.1 200 OK
+# X-Capability-Id: child-jti
+# X-Capability-Chain-Depth: 2
+```
+
+越权委托与失效链的拒绝行为：
+
+```text
+POST /tokens/delegate 申请 /files-evil、DELETE、别的 subject  → 403 path_mismatch /
+                                                               method_mismatch /
+                                                               delegation_denied
+父令牌已过期 / 已撤销 / 一次性 nonce 已消费                     → 401 expired /
+                                                               subject_revoked /
+                                                               nonce_replayed
+第 5 层委托（父链已达深度 4）                                   → 403 chain_too_deep
+验证一个父级已撤销/过期/被重放的子令牌                          → 401（递归校验命中祖先）
+```
+
+要点：
+
+- **一次性令牌的整条链都是一次性的**：使用子令牌时，链上每个一次性令牌的 nonce 都会在
+  **同一个 `BEGIN IMMEDIATE` 事务**中原子写入；任一 nonce 已被消费，整链拒绝。因此一次性
+  父令牌不能通过"多签几个子令牌"来放大使用次数；撤销命中时同样不烧任何 nonce；
+- 委托本身以 `consume=false` 方式校验父令牌，**提交父令牌做委托不会消耗它**，父令牌在其
+  寿命内可多次委托；
+- 撤销父令牌主体即同时作废其全部后代（后代必须沿用同一 `subject`），撤销后新签发且
+  `iat > cutoff` 的令牌不受影响；
+- 嵌套委托时把上一级子令牌当作 `parent_token` 再次提交即可，深度依次为 2、3、4；
+  深度在签名负载里无法伪造放大——超出上限的令牌即使签名合法也在验证时被拒。
+
+> **Docker 调用示例**：容器镜像、启动命令与端口映射均未改变（仍是
+> `docker compose up --build`，服务监听 `8000`），委托功能也不需要任何新的环境变量。
+> 在 compose 运行期间，从宿主机即可直接体验一条完整委托链：
+>
+> ```bash
+> # 1) 容器内服务签发父令牌
+> PARENT=$(curl -s -X POST http://localhost:8000/tokens/issue \
+>   -H 'Content-Type: application/json' \
+>   -d '{"method":"GET","path":"/files","ttl_seconds":600,"subject":"alice"}' \
+>   | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+>
+> # 2) 用父令牌在容器外申请收窄的子令牌（TTL 自动截断到父令牌剩余寿命）
+> CHILD=$(curl -s -X POST http://localhost:8000/tokens/delegate \
+>   -H 'Content-Type: application/json' \
+>   -d "{\"parent_token\":\"${PARENT}\",\"method\":\"GET\",
+>        \"path\":\"/files/hello.txt\",\"ttl_seconds\":120}" \
+>   | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+>
+> # 3) 递归验证（链上每一跳签名/过期/撤销/nonce/约束都被检查）
+> curl -s -X POST http://localhost:8000/tokens/verify \
+>   -H 'Content-Type: application/json' \
+>   -d "{\"token\":\"${CHILD}\",\"method\":\"GET\",\"path\":\"/files/hello.txt\"}"
+>
+> # 4) 用子令牌下载，响应头回显链深
+> curl -i "http://localhost:8000/files/hello.txt?token=${CHILD}"
+> # X-Capability-Chain-Depth: 2
+> ```
+
 ## 无中断密钥轮换（CAPABILITY_KEYRING）
 
 密钥环是一个**有序**的 `kid:secret` 列表（逗号分隔，冒号按**第一个**切分，所以 secret
@@ -287,21 +430,27 @@ kid `default` 签发，同一 secret 自动兼作 legacy 验签键，旧令牌�
 `verify_token` 按以下顺序检查，任何一步失败立即返回稳定错误码：
 
 1. **结构**：令牌必须为 `<base64url(payload)>.<base64url(signature)>`，payload 是 JSON 对象；
+   若负载含 `del` 声明，则沿其内嵌的父令牌**递归**解析整链；
 2. **选键**：负载含 `kid` 时，按 kid 在密钥环中**精确取一个** HMAC 密钥（不遍历、不回退），
    kid 未知返回 `401 unknown_key`；负载不含 `kid`（升级前旧令牌）时，只允许使用
-   `CAPABILITY_LEGACY_SECRET`，未配置则返回 `401 unknown_key`；
-3. **签名**：用所选的唯一一个密钥计算 `HMAC-SHA256(secret, payload)`，与令牌附带签名用
-   `hmac.compare_digest` 常量时间比较，防止时序攻击；
-4. **负载声明**：版本号 `v=1`，`kid`（若存在）为非空字符串，`m`/`p`/`jti` 为非空字符串，
-   `iat`/`exp` 为整数且 `iat <= exp`，`one` 为布尔；
-5. **过期时间**：当前时间 `>= exp` 即拒绝（`expired`）；
-6. **方法绑定**：令牌方法 ≠ 请求方法返回 `403 method_mismatch`；
-7. **路径绑定**：令牌路径 ≠ 规范化后的请求路径返回 `403 path_mismatch`；
-8. **主体撤销 + 一次性 nonce**：在**同一个 `BEGIN IMMEDIATE` 事务**中先查
-   `subject_revocations`（`iat <= cutoff` 则返回 `401 subject_revoked`，且不消耗
-   nonce），再在需要时原子写入 `consumed_nonces`（已存在则返回 `nonce_replayed`）。
-   撤销与验证并发竞争时由事务串行化裁决：要么验证先提交（nonce 已消费、撤销后至），
-   要么撤销先生效（验证被拒、nonce 保留），绝不出现"被撤销却烧掉 nonce"的中间态。
+   `CAPABILITY_LEGACY_SECRET`，未配置则返回 `401 unknown_key`。**链中每一跳独立选键**，
+   因此密钥轮换期间同一条链的各层可以由不同 kid 签发；
+3. **签名**：对链中**每一跳**用其声明的唯一一个密钥计算 `HMAC-SHA256(secret, payload)`，
+   与令牌附带签名用 `hmac.compare_digest` 常量时间比较，防止时序攻击；
+4. **负载声明**：每层版本号 `v=1`，`kid`（若存在）为非空字符串，`m`/`p`/`jti` 为非空字符串，
+   `iat`/`exp` 为整数且 `iat <= exp`，`one` 为布尔，`del`（若存在）为非空字符串且不构成环；
+5. **过期时间**：**每一跳**当前时间 `>= exp` 即拒绝（`expired`）——父过期则子令牌失效；
+6. **委托包含关系**：对每一对子/父令牌从签名负载重新推导：方法相同、子路径位于父路径段内、
+   子 `exp <= 父 exp`、主体相同、子令牌在父令牌有效期内签发；任一不满足返回
+   `403 delegation_denied`；
+7. **链深**：链中令牌总数（根令牌计 1）超过 4 返回 `403 chain_too_deep`；
+8. **方法绑定**：叶子令牌方法 ≠ 请求方法返回 `403 method_mismatch`；
+9. **路径绑定**：叶子令牌路径 ≠ 规范化后的请求路径返回 `403 path_mismatch`；
+10. **主体撤销 + 一次性 nonce（全链、单事务）**：在**同一个 `BEGIN IMMEDIATE` 事务**中对
+    链上每一跳先查 `subject_revocations`（`iat <= cutoff` 则返回 `401 subject_revoked`，
+    且不消耗任何 nonce），再把链中所有一次性令牌的 nonce 原子写入 `consumed_nonces`
+    （任一已存在则整链 `nonce_replayed`）。撤销与验证并发竞争时由事务串行化裁决，绝不出现
+    "被撤销却烧掉 nonce"的中间态。
 
 ### 路径规范化
 
@@ -325,8 +474,10 @@ kid `default` 签发，同一 secret 自动兼作 legacy 验签键，旧令牌�
 | `expired` | 401 | 令牌已过期 |
 | `nonce_replayed` | 401 | 一次性令牌被重复使用 |
 | `subject_revoked` | 401 | 主体已被撤销（`iat` 不晚于撤销截止时间） |
-| `method_mismatch` | 403 | HTTP 方法与绑定不一致 |
-| `path_mismatch` | 403 | 路径与绑定不一致 |
+| `method_mismatch` | 403 | HTTP 方法与绑定不一致（含子令牌方法不同于父令牌） |
+| `path_mismatch` | 403 | 路径与绑定不一致，或委托路径不在父路径段内 |
+| `chain_too_deep` | 403 | 委托链超过 4 层（根令牌计第 1 层） |
+| `delegation_denied` | 403 | 子令牌突破父令牌约束（路径越界 / 晚于父令牌过期 / 主体不同 / 非父令牌有效期内签发） |
 | `unauthorized` | 401 | 缺少或错误的 `X-Issuer-Key` / `X-Admin-Key` |
 | `admin_key_not_configured` | 503 | 未配置 `CAPABILITY_ADMIN_KEY`，管理接口未启用 |
 | `validation_error` | 422 | 请求体未通过 Pydantic 校验 |
@@ -350,14 +501,19 @@ kid `default` 签发，同一 secret 自动兼作 legacy 验签键，旧令牌�
   "jti": "z1w6w4XPKcDQ2mkotgWgng",
   "one": true,
   "sub": "alice",
+  "del": "<父令牌完整字符串，仅委托令牌携带>",
   "ext": {}
 }
 ```
 
 - `kid` 是签名密钥的标识，和方法/路径一样受签名保护：篡改 `kid` 会直接 `bad_signature`，
   无法把令牌"换标"成另一个键；升级前签发的旧令牌没有该字段，只能走 legacy 通道；
+- `del` 是**委托令牌**才有的声明，值为父令牌的完整
+  `<payload>.<signature>` 字符串，同样纳入本层 HMAC。验证子令牌时递归解析 `del` 链，
+  链中每个令牌自验自签；没有 `del` 的令牌就是委托链的根（深度 1）；
 - 多用途令牌（`one=false`）**完全无状态**：只靠签名和过期即可验证，数据库不记录任何东西；
 - 一次性令牌只在服务端记住一个不透明 nonce（`jti`），不存储令牌或负载内容。
+  属于委托链时，链上每一层的一次性 nonce 都会在同一事务中检查/消费。
 
 ## 一次性 nonce 的原子性（防重放）
 
@@ -434,7 +590,12 @@ python tests/test_api.py
 无 kid 旧令牌仅经 legacy secret 验证（禁止遍历密钥环试签）、kid 受签名保护、
 **完整轮换（前置新键→旧令牌可用→移除旧键→旧令牌即失效）**、kid 类型校验、
 密钥环解析与启动配置校验（重复 kid / 空密钥 / 冲突配置 / 空环拒绝启动）、
-旧版单密钥模式兼容等 48 个用例。
+旧版单密钥模式兼容，以及**令牌委托**相关的委托响应结构与链深回显、TTL 被父令牌剩余寿命
+截断、路径段包含（`/files` 不覆盖 `/files-evil`）、方法/主体收窄校验、非法父令牌拒绝、
+**4 层链深上限（签发与验证双侧拒绝第 5 层，即便签名合法）**、过期祖先/内嵌令牌篡改/
+子令牌超期越权（即使重新签名）均拒绝、**撤销父令牌连带作废子令牌且恢复后可用**、
+**一次性父令牌的整条链一次性（使用子令牌同时烧掉每层 nonce、dry-run 不烧）**、
+委托令牌下载与 `X-Capability-Chain-Depth` 头、请求体 422 校验等 62 个用例。
 
 ## 部署说明
 

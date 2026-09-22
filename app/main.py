@@ -23,12 +23,15 @@ from fastapi.responses import FileResponse, JSONResponse
 from .config import Settings, load_settings
 from .db import Database
 from .schemas import (
+    DelegatedTokenResponse,
+    DelegateTokenRequest,
     IssuedTokenResponse,
     IssueTokenRequest,
     RevocationEntry,
     RevocationListResponse,
     RevokeSubjectRequest,
     RevokeSubjectResponse,
+    TokenConstraints,
     VerifyTokenRequest,
     VerifyTokenResponse,
 )
@@ -36,6 +39,7 @@ from .tokens import (
     TokenError,
     canonical_method,
     canonical_path,
+    delegate_token,
     issue_token,
     verify_token,
 )
@@ -53,6 +57,8 @@ _ERROR_STATUS = {
     "subject_revoked": status.HTTP_401_UNAUTHORIZED,
     "method_mismatch": status.HTTP_403_FORBIDDEN,
     "path_mismatch": status.HTTP_403_FORBIDDEN,
+    "chain_too_deep": status.HTTP_403_FORBIDDEN,
+    "delegation_denied": status.HTTP_403_FORBIDDEN,
 }
 
 #: Delete expired consumed nonces and stale revocations periodically.
@@ -144,11 +150,13 @@ async def lifespan(app: FastAPI) -> None:
 
 app = FastAPI(
     title="Capability Token API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "Issue short-lived HMAC-signed capability tokens for HTTP operations "
         "(e.g. file downloads) and verify method/path binding, expiry, "
-        "signature, one-time nonces and subject-level revocation."
+        "signature, one-time nonces and subject-level revocation. Tokens can "
+        "delegate narrowed capabilities (POST /tokens/delegate); the signed "
+        "delegation chain is verified recursively, at most 4 tokens deep."
     ),
     lifespan=lifespan,
 )
@@ -220,6 +228,22 @@ def health(request: Request) -> dict[str, object]:
     return {"status": "ok", "time": int(time.time())}
 
 
+def _constraints_of(verified) -> TokenConstraints:
+    """Final effective constraints after walking the delegation chain.
+
+    Every child must stay inside its parent, so the leaf token carries the
+    narrowest method/path/expiry/subject — which is exactly what governs the
+    capability presented.
+    """
+    return TokenConstraints(
+        method=verified.method,
+        path=verified.path,
+        expires_at=verified.expires_at,
+        subject=verified.subject,
+        one_time=verified.one_time,
+    )
+
+
 @app.post(
     "/tokens/issue",
     response_model=IssuedTokenResponse,
@@ -260,6 +284,82 @@ def issue(body: IssueTokenRequest, settings: SettingsDep) -> IssuedTokenResponse
         expires_in=issued.expires_in,
         one_time=issued.one_time,
         subject=body.subject,
+        chain_depth=1,
+        constraints=TokenConstraints(
+            method=issued.method,
+            path=issued.path,
+            expires_at=issued.expires_at,
+            subject=body.subject,
+            one_time=issued.one_time,
+        ),
+    )
+
+
+@app.post(
+    "/tokens/delegate",
+    response_model=DelegatedTokenResponse,
+    tags=["tokens"],
+)
+def delegate(
+    body: DelegateTokenRequest, settings: SettingsDep, db: DbDep
+) -> DelegatedTokenResponse:
+    """Mint a child token that never exceeds its parent's authority.
+
+    The parent token (and its whole delegation chain) is verified first.
+    The child may only reuse the parent's method, address a path segment
+    underneath the parent's path, live no longer than the parent's remaining
+    lifetime (the TTL is capped automatically) and keep the same subject.
+    The parent token is embedded in the child's signed ``del`` claim, so
+    verification later walks and checks every hop.
+    """
+    requested_ttl = min(body.ttl_seconds, settings.max_ttl)
+    try:
+        result = delegate_token(
+            body.parent_token,
+            keyring=settings.keyring,
+            db=db,
+            method=body.method,
+            path=body.path,
+            ttl_seconds=requested_ttl,
+            subject=body.subject,
+        )
+    except TokenError as exc:
+        raise _http_error(exc) from exc
+
+    issued = result.issued
+    logger.info(
+        "Delegated token jti=%s parent_jti=%s depth=%s %s %s exp=%s sub=%s capped=%s",
+        issued.nonce,
+        result.parent_nonce,
+        result.chain_depth,
+        issued.method,
+        issued.path,
+        issued.expires_at,
+        issued.payload.get("sub"),
+        issued.expires_in < requested_ttl,
+    )
+    return DelegatedTokenResponse(
+        token=issued.token,
+        token_id=issued.nonce,
+        kid=issued.kid,
+        method=issued.method,
+        path=issued.path,
+        issued_at=issued.payload["iat"],
+        expires_at=issued.expires_at,
+        expires_in=issued.expires_in,
+        one_time=issued.one_time,
+        subject=issued.payload.get("sub"),
+        chain_depth=result.chain_depth,
+        constraints=TokenConstraints(
+            method=issued.method,
+            path=issued.path,
+            expires_at=issued.expires_at,
+            subject=issued.payload.get("sub"),
+            one_time=issued.one_time,
+        ),
+        parent_token_id=result.parent_nonce,
+        parent_expires_at=result.parent_expires_at,
+        ttl_capped_to_parent=issued.expires_in < requested_ttl,
     )
 
 
@@ -290,6 +390,8 @@ def verify(body: VerifyTokenRequest, settings: SettingsDep, db: DbDep) -> Verify
         token_id=verified.nonce,
         subject=verified.subject,
         extra=verified.extra,
+        chain_depth=verified.chain_depth,
+        constraints=_constraints_of(verified),
     )
 
 
@@ -402,11 +504,20 @@ def download_file(
     if not target.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
 
-    logger.info("Download served jti=%s sub=%s file=%s", verified.nonce, verified.subject, target)
+    logger.info(
+        "Download served jti=%s sub=%s depth=%s file=%s",
+        verified.nonce,
+        verified.subject,
+        verified.chain_depth,
+        target,
+    )
     return FileResponse(
         target,
         filename=target.name,
-        headers={"X-Capability-Id": verified.nonce},
+        headers={
+            "X-Capability-Id": verified.nonce,
+            "X-Capability-Chain-Depth": str(verified.chain_depth),
+        },
     )
 
 

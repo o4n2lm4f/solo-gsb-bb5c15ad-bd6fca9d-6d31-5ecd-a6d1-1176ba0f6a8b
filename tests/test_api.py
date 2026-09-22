@@ -71,6 +71,27 @@ class CapabilityApiTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200, resp.text)
         return resp.json()
 
+    def delegate(self, parent_token, **overrides):
+        body = {
+            "parent_token": parent_token,
+            "method": "GET",
+            "path": "/files/hello.txt",
+            "ttl_seconds": 60,
+        }
+        body.update(overrides)
+        return self.client.post("/tokens/delegate", json=body)
+
+    def delegate_core(self, parent_token, **overrides):
+        body = {
+            "keyring": app.state.settings.keyring,
+            "db": app.state.db,
+            "method": "GET",
+            "path": "/files/hello.txt",
+            "ttl_seconds": 60,
+        }
+        body.update(overrides)
+        return tokenlib.delegate_token(parent_token, **body)
+
     def verify(self, token, method="GET", path="/files/hello.txt", consume=True):
         return self.client.post(
             "/tokens/verify",
@@ -905,6 +926,267 @@ class CapabilityApiTests(unittest.TestCase):
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+
+
+    # -- delegation ---------------------------------------------------------
+
+    def test_47_delegate_happy_path_response_shape(self):
+        root = self.issue(path="/files", ttl_seconds=120, subject="alice")
+        resp = self.delegate(root["token"], path="/files/hello.txt", ttl_seconds=60)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(body["chain_depth"], 2)
+        self.assertEqual(body["parent_token_id"], root["token_id"])
+        self.assertEqual(body["parent_expires_at"], root["expires_at"])
+        self.assertFalse(body["ttl_capped_to_parent"])
+        self.assertEqual(body["subject"], "alice")
+        self.assertEqual(body["path"], "/files/hello.txt")
+        self.assertEqual(body["method"], "GET")
+        self.assertEqual(body["constraints"]["path"], "/files/hello.txt")
+        self.assertEqual(body["constraints"]["subject"], "alice")
+        # The signed payload embeds the full parent token under "del".
+        payload_b = base64.urlsafe_b64decode(body["token"].split(".")[0] + "==")
+        payload = json.loads(payload_b)
+        self.assertEqual(payload["del"], root["token"])
+
+        # Verification reports depth 2 and the final constraints.
+        v = self.verify(body["token"])
+        self.assertEqual(v.status_code, 200, v.text)
+        vj = v.json()
+        self.assertTrue(vj["valid"])
+        self.assertEqual(vj["chain_depth"], 2)
+        self.assertEqual(vj["constraints"]["path"], "/files/hello.txt")
+        self.assertEqual(vj["constraints"]["expires_at"], body["expires_at"])
+
+        # Plain root tokens still report depth 1 and constraints.
+        v0 = self.verify(root["token"], path="/files")
+        self.assertEqual(v0.json()["chain_depth"], 1)
+
+    def test_48_delegate_ttl_is_capped_to_parent_remaining_life(self):
+        root = self.issue(path="/files", ttl_seconds=30)
+        resp = self.delegate(root["token"], path="/files/hello.txt", ttl_seconds=3600)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertTrue(body["ttl_capped_to_parent"])
+        self.assertLessEqual(body["expires_at"], root["expires_at"])
+        self.assertLessEqual(body["expires_in"], 30)
+
+    def test_49_delegate_path_must_be_under_parent(self):
+        root = self.issue(path="/files", ttl_seconds=60)
+        # Same prefix but different segment is denied.
+        resp = self.delegate(root["token"], path="/files-evil/x")
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["error"], "path_mismatch")
+        # Outside entirely.
+        resp = self.delegate(root["token"], path="/admin")
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["error"], "path_mismatch")
+        # Sub-path and the exact path are fine.
+        for ok_path in ("/files/hello.txt", "/files"):
+            self.assertEqual(
+                self.delegate(root["token"], path=ok_path).status_code, 200, ok_path
+            )
+
+    def test_50_delegate_method_and_subject_must_match(self):
+        root = self.issue(path="/files", ttl_seconds=60, subject="alice")
+        resp = self.delegate(root["token"], method="POST", path="/files/x")
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["error"], "method_mismatch")
+        resp = self.delegate(root["token"], path="/files/x", subject="bob")
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["error"], "delegation_denied")
+        # Omitting subject inherits the parent's; repeating it identically works.
+        self.assertEqual(
+            self.delegate(root["token"], path="/files/x").json()["subject"], "alice"
+        )
+        self.assertEqual(
+            self.delegate(root["token"], path="/files/y", subject="alice").status_code, 200
+        )
+
+    def test_51_delegate_invalid_parent_is_rejected(self):
+        # Malformed parent.
+        resp = self.delegate("not-a-token", path="/files/x")
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["error"], "malformed")
+        # Method-unrelated check still validates the parent on its own terms:
+        # an unrelated token signed properly but bound elsewhere is valid as a
+        # parent, but cannot cover the requested path.
+        other = self.issue(path="/other", ttl_seconds=60)
+        resp = self.delegate(other["token"], path="/files/x")
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["error"], "path_mismatch")
+
+    def test_52_chain_depth_limit_four(self):
+        # Build a legal chain root..depth4 through the HTTP API.
+        current = self.issue(path="/files", ttl_seconds=300)["token"]
+        for depth in range(2, 5):
+            resp = self.delegate(current, path="/files/hello.txt", ttl_seconds=60)
+            self.assertEqual(resp.status_code, 200, f"depth {depth}: {resp.text}")
+            self.assertEqual(resp.json()["chain_depth"], depth)
+            current = resp.json()["token"]
+        # The fifth delegation is refused at issuance.
+        resp = self.delegate(current, path="/files/hello.txt", ttl_seconds=10)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["error"], "chain_too_deep")
+        # The depth-4 token still verifies and downloads.
+        self.assertEqual(self.verify(current).status_code, 200)
+        dl = self.client.get(f"/files/hello.txt?token={current}")
+        self.assertEqual(dl.status_code, 200, dl.text)
+        self.assertEqual(dl.headers["X-Capability-Chain-Depth"], "4")
+
+    def test_53_forged_fifth_layer_is_rejected_at_verify(self):
+        # A validly signed but over-deep chain cannot be presented directly.
+        current = self.issue(path="/files", ttl_seconds=300)["token"]
+        for _ in range(3):
+            current = self.delegate(current, path="/files/hello.txt", ttl_seconds=60).json()[
+                "token"
+            ]
+        # Hand-mint a well-formed child of the depth-4 token with the real key.
+        depth4_parent = current
+        now = int(time.time())
+        payload = tokenlib.build_payload(
+            method="GET",
+            path="/files/hello.txt",
+            expires_at=now + 30,
+            issued_at=now,
+            nonce=tokenlib.new_nonce(),
+            one_time=False,
+            kid=ACTIVE_KID,
+            delegated_from=depth4_parent,
+        )
+        token = self._raw_token(payload, b"active-secret")
+        resp = self.verify(token)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["error"], "chain_too_deep")
+
+    def test_54_recursive_checks_expired_or_tampered_ancestor(self):
+        settings = app.state.settings
+        now = int(time.time())
+        # Parent that has expired by now.
+        expired = tokenlib.issue_token(
+            settings.keyring,
+            method="GET",
+            path="/files",
+            ttl_seconds=10,
+            subject="alice",
+            now=now - 30,
+        )
+        resp = self.delegate(expired.token, path="/files/hello.txt", ttl_seconds=10)
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["error"], "expired")
+
+        # Tamper the embedded parent inside an otherwise valid child: the
+        # child's HMAC still covers the (now altered) "del" string, so we must
+        # rebuild the child signature after changing it — which proves the
+        # chain walk catches an invalid embedded token.
+        root = tokenlib.issue_token(
+            settings.keyring, method="GET", path="/files", ttl_seconds=120, subject="alice"
+        )
+        child = self.delegate_core(root.token, path="/files/hello.txt", ttl_seconds=60).issued
+        payload = dict(child.payload)
+        payload["del"] = payload["del"].replace(payload["del"][0], "X", 1)
+        forged = self._raw_token(payload, b"active-secret")
+        resp = self.verify(forged)
+        self.assertEqual(resp.status_code, 401)
+        self.assertIn(resp.json()["error"], ("malformed", "bad_signature", "bad_payload"))
+
+    def test_55_child_outliving_parent_is_rejected_even_if_signed(self):
+        settings = app.state.settings
+        now = int(time.time())
+        parent = tokenlib.issue_token(
+            settings.keyring, method="GET", path="/files", ttl_seconds=10, subject="alice"
+        )
+        # Forge a child signed by the active key that lives longer than parent.
+        payload = tokenlib.build_payload(
+            method="GET",
+            path="/files/hello.txt",
+            expires_at=now + 300,
+            issued_at=now,
+            nonce=tokenlib.new_nonce(),
+            one_time=False,
+            kid=ACTIVE_KID,
+            subject="alice",
+            delegated_from=parent.token,
+        )
+        forged = self._raw_token(payload, b"active-secret")
+        resp = self.verify(forged)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["error"], "delegation_denied")
+
+    def test_56_revoked_parent_invalidates_children(self):
+        subject = "del-revo"
+        root = self.issue(path="/files", ttl_seconds=600, subject=subject)
+        child = self.delegate(root["token"], path="/files/hello.txt", ttl_seconds=60).json()
+        # Both work initially.
+        self.assertEqual(self.verify(root["token"], path="/files").status_code, 200)
+        self.assertEqual(self.verify(child["token"]).status_code, 200)
+        # Revoke the subject: the whole chain dies.
+        self.revoke(subject, cutoff=int(time.time()) + 5)
+        self.assertEqual(self.verify(root["token"], path="/files").status_code, 401)
+        resp = self.verify(child["token"])
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["error"], "subject_revoked")
+        # Restore and both work again (checks never burn nonces for multi-use).
+        self.revoke(subject, restore=True)
+        self.assertEqual(self.verify(child["token"]).status_code, 200)
+
+    def test_57_one_time_parent_makes_whole_chain_single_use(self):
+        root = self.issue(path="/files", ttl_seconds=300, one_time=True, subject="ot-del")
+        child = self.delegate(root["token"], path="/files/hello.txt", ttl_seconds=60).json()
+        self.assertTrue(child["one_time"])
+        # Dry run burns nothing.
+        self.assertEqual(self.verify(child["token"], consume=False).status_code, 200)
+        # First real use consumes every one-time nonce in the chain.
+        first = self.verify(child["token"])
+        self.assertEqual(first.status_code, 200)
+        self.assertTrue(first.json()["consumed"])
+        self.assertEqual(self.verify(child["token"]).status_code, 401)
+        # The parent cannot be replayed either — no privilege widening.
+        resp = self.verify(root["token"], path="/files")
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["error"], "nonce_replayed")
+
+    def test_58_delegated_download_serves_and_checks_chain(self):
+        root = self.issue(path="/files", ttl_seconds=120, subject="dl-del")
+        child = self.delegate(root["token"], path="/files/hello.txt", ttl_seconds=60).json()
+        resp = self.client.get(f"/files/hello.txt?token={child['token']}")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertIn("hello capability world", resp.text)
+        self.assertEqual(resp.headers["X-Capability-Chain-Depth"], "2")
+        # A child bound to a sub-path cannot download elsewhere.
+        root2 = self.issue(path="/files", ttl_seconds=120)
+        child2 = self.delegate(root2["token"], path="/files/hello.txt", ttl_seconds=60).json()
+        resp = self.client.get(f"/files/other.txt?token={child2['token']}")
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["error"], "path_mismatch")
+
+    def test_59_delegate_requires_ttl_and_validates_request(self):
+        root = self.issue(path="/files", ttl_seconds=120)
+        base = {"parent_token": root["token"], "method": "GET", "path": "/files/x"}
+        # Missing ttl_seconds -> 422.
+        resp = self.client.post("/tokens/delegate", json=base)
+        self.assertEqual(resp.status_code, 422)
+        # ttl <= 0 -> 422.
+        resp = self.client.post("/tokens/delegate", json={**base, "ttl_seconds": 0})
+        self.assertEqual(resp.status_code, 422)
+        # path without leading slash -> 422.
+        resp = self.client.post(
+            "/tokens/delegate", json={**base, "path": "files/x", "ttl_seconds": 10}
+        )
+        self.assertEqual(resp.status_code, 422)
+        # Missing parent token -> 422.
+        resp = self.client.post(
+            "/tokens/delegate",
+            json={"method": "GET", "path": "/files/x", "ttl_seconds": 10},
+        )
+        self.assertEqual(resp.status_code, 422)
+
+    def test_60_path_within_helper_is_segment_aware(self):
+        self.assertTrue(tokenlib.path_is_within("/files/a", "/files"))
+        self.assertTrue(tokenlib.path_is_within("/files", "/files"))
+        self.assertTrue(tokenlib.path_is_within("/anything", "/"))
+        self.assertFalse(tokenlib.path_is_within("/files-evil", "/files"))
+        self.assertFalse(tokenlib.path_is_within("/filesx", "/files"))
 
 
 if __name__ == "__main__":
