@@ -1,0 +1,2 @@
+This is a demo file served by the guarded GET /files/{name} endpoint.
+Present a valid GET /files/hello.txt capability token to download it.
